@@ -11,6 +11,7 @@ from .settings import (
     CELL_M,
     CELL_ARRIVAL_TOL_M,
     GIMBAL_SPEED,
+    GIMBAL_MOVE_TIMEOUT_MIN_S,
     KD_YAW,
     KP_SIDE,
     KP_YAW,
@@ -22,6 +23,8 @@ from .settings import (
     SENSOR_MAP_FILE,
     SENSOR_STALE_S,
     TOF_RECOVERY_MARGIN_MM,
+    TOF_ARRIVAL_MAX_ODOM_GAP_M,
+    TOF_ARRIVAL_WALL_TOL_MM,
     SHARP_ADC_MIN,
     SHARP_RANGE_CM,
     SHARP_STALE_S,
@@ -285,14 +288,19 @@ class RealRobot:
             if action is None:
                 raise HardwareFault(f"{label}: command was not accepted")
             deadline = time.monotonic() + timeout
-            while not action.is_completed:
+            while True:
                 self._check_stop()
+                if action.is_completed:
+                    if action.has_succeeded:
+                        return
+                    # The SDK sets is_completed at 100% progress even while
+                    # its state still says action_running. Wait for the final
+                    # success/failure push instead of treating that as failure.
+                    if action.state not in ("action_running", "action_started"):
+                        raise HardwareFault(f"{label}: action failed ({action.state})")
                 if time.monotonic() >= deadline:
                     raise HardwareFault(f"{label}: timed out")
                 self._pause(0.02)
-            self._check_stop()
-            if not action.has_succeeded:
-                raise HardwareFault(f"{label}: action failed ({action.state})")
         except (Aborted, HardwareFault):
             self.stop_all()
             raise
@@ -389,7 +397,7 @@ class RealRobot:
                  if previous is not None else 180.0)
         # SDK actions occasionally take longer than their nominal angular travel.
         # Keep a margin for transport/settling, while retaining a finite fault deadline.
-        timeout = max(6.0, angle / max(speed, 1.0) + 3.0)
+        timeout = max(GIMBAL_MOVE_TIMEOUT_MIN_S, angle / max(speed, 1.0) + 3.0)
         self._gimbal_moving = True
         self._refresh_status_led()
         try:
@@ -434,8 +442,16 @@ class RealRobot:
         self._wait_action("chassis correction", action, MOVE_TIMEOUT_S)
         self._pause(0.3)
 
+    def _tof_confirms_cell_arrival(self, reading: Optional[float], distance: float,
+                                   known_end_wall: bool) -> bool:
+        """Accept a short odometry reading only against a mapped, nearby end wall."""
+        return (known_end_wall and reading is not None
+                and CELL_M - TOF_ARRIVAL_MAX_ODOM_GAP_M <= distance <= CELL_M + CELL_ARRIVAL_TOL_M
+                and reading >= BUMPER_MM + TOF_RECOVERY_MARGIN_MM
+                and abs(reading - self.wall_center_mm) <= TOF_ARRIVAL_WALL_TOL_MM)
+
     @chassis_led
-    def forward_one_cell(self, target_yaw: float, check) -> float:
+    def forward_one_cell(self, target_yaw: float, check, known_end_wall: bool = False) -> float:
         """ เดินหน้า 1 ช่องแล้วหยุดกลางช่องถัดไป คืนสัดส่วนระยะที่เดินได้ (1.0 = ครบช่อง)
         - ระยะที่เหลือจาก odometry (ไม่มีค่าใหม่ = หยุด) และถ้า ToF เห็นกำแพงหน้าช่องถัดไป
           ใช้ ToF ด้วย (หยุดเมื่อ ToF = wall_center_mm) เอาค่าที่น้อยกว่า แล้วชะลอเข้าหาจุดหยุด
@@ -443,6 +459,7 @@ class RealRobot:
         - IMU คุมหัวตรง, Sharp (ถ้ามี) สไลด์ให้อยู่กลางช่อง สะสมไม่เกิน MAX_SIDE_SHIFT_M ต่อช่อง
         - กันชน: ToF ใกล้กว่า BUMPER_MM ติดกัน BUMPER_SAMPLES ค่า = เบรก / ToF ค้าง = หยุดรถทันที """
         use_odom = time.monotonic() - self.pos_t < ODOM_STALE_S
+        self.tof_arrival_confirmed = False
         if not use_odom:
             self.stop_wheels()
             raise HardwareFault("no fresh odometry: cannot confirm cell arrival")
@@ -498,6 +515,11 @@ class RealRobot:
                             break
                         fresh = self.read_tof_mm()
                         needed = BUMPER_MM + (CELL_M - estimate) * 1000 + TOF_RECOVERY_MARGIN_MM
+                        if self._tof_confirms_cell_arrival(fresh, estimate, known_end_wall):
+                            # The mapped end wall confirms the centre more closely
+                            # than odometry. SLAM will verify the cell on arrival.
+                            self.tof_arrival_confirmed = True
+                            break
                         if fresh is None or fresh < needed:
                             raise HardwareFault(
                                 f"front ToF still blocked at {fresh} mm; moved {estimate:.3f} m, "
@@ -536,9 +558,16 @@ class RealRobot:
             raise HardwareFault("odometry stale at cell arrival")
         if bumper_stopped and estimate >= CELL_M - CELL_ARRIVAL_TOL_M:
             raise HardwareFault("bumper stopped near the cell centre: cannot confirm arrival")
-        if not bumper_stopped and abs(estimate - CELL_M) > CELL_ARRIVAL_TOL_M:
-            raise HardwareFault(f"not at cell centre: moved {estimate:.3f} m, expected {CELL_M:.3f} m; "
-                                f"front ToF {front} mm")
+        if not bumper_stopped and not self.tof_arrival_confirmed and abs(estimate - CELL_M) > CELL_ARRIVAL_TOL_M:
+            # Odometry can settle a few millimetres short after braking. A
+            # fresh, stationary ToF reading against the mapped end wall can
+            # confirm arrival without driving closer to that wall.
+            fresh = self.read_tof_mm() if known_end_wall and estimate < CELL_M else None
+            if self._tof_confirms_cell_arrival(fresh, estimate, known_end_wall):
+                self.tof_arrival_confirmed = True
+            else:
+                raise HardwareFault(f"not at cell centre: moved {estimate:.3f} m, expected {CELL_M:.3f} m; "
+                                    f"front ToF {front} mm")
         return estimate / CELL_M
 
     @chassis_led
@@ -558,14 +587,14 @@ class RealRobot:
         if abs(left_m) > 0.06:
             raise HardwareFault("sideways correction exceeds 60 mm")
         action = gs.safe_call("chassis lateral", self.chassis.move, x=0, y=-left_m, z=0, xy_speed=0.15)
-        self._wait_action("lateral correction", action, 4)
+        self._wait_action("lateral correction", action, 5)
         self.stop_wheels()
         self.ensure_stopped()
         self._check_stop()
 
-    def fire(self) -> bool:
+    def fire(self, times: int = 1) -> bool:
         self._check_stop()
-        ok = gs.safe_call("blaster fire", self.blaster.fire, fire_type=blaster.WATER_FIRE, times=1)
+        ok = gs.safe_call("blaster fire", self.blaster.fire, fire_type=blaster.WATER_FIRE, times=times)
         self.leds.silence_gimbal_lights()  # ไม่ใช้ไฟกระพริบตอนยิง กันแสงเข้ากล้อง
         return bool(ok)
 

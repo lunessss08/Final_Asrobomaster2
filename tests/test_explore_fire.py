@@ -106,7 +106,7 @@ class ExploreFireTests(unittest.TestCase):
         commands = list(m.io.gimbal_to.call_args_list)
         self.assertEqual([c.args for c in commands[:5]],
                          [(0, -90), (-20, -90), (-15, -90), (-10, -90), (-5, -90)])
-        self.assertEqual(commands[1].kwargs.get('speed'), 60)
+        self.assertEqual(commands[1].kwargs.get('speed'), 90)
         self.assertFalse(any(c.args[0] > 0 for c in commands))
         self.assertEqual(m.maze.edge((0, 0), (0, 1)), 1)
         self.assertEqual(m.maze.edge((0, 0), (1, 0)), 1)
@@ -133,14 +133,14 @@ class ExploreFireTests(unittest.TestCase):
             self.assertAlmostEqual(distance, 0.87, delta=0.02)
             self.assertAlmostEqual(lateral, 0, delta=0.01)
 
-    def test_real_gimbal_uses_slow_scan_speed(self):
+    def test_real_gimbal_uses_configured_scan_speed(self):
         io = RealRobot.__new__(RealRobot)
         io._stop_event = threading.Event()
         io.gimbal = Mock()
         io._wait_action = Mock()
-        io.gimbal_to(-5, 0, speed=60)
+        io.gimbal_to(-5, 0, speed=90)
         io.gimbal.moveto.assert_called_once_with(
-            pitch=-5, yaw=0, pitch_speed=60, yaw_speed=60)
+            pitch=-5, yaw=0, pitch_speed=90, yaw_speed=90)
 
     @patch('robo_app.maze.mission.time.sleep')
     def test_wall_plate_is_fired_from_current_cell_after_near_scan(self, sleep):
@@ -172,6 +172,75 @@ class ExploreFireTests(unittest.TestCase):
         self.assertEqual(m.cell, (3, 0))
         self.assertEqual(m.aim_and_fire.call_count, 1)
 
+    @patch('robo_app.maze.mission.time.sleep')
+    def test_cropped_shallow_view_does_not_override_deep_plate_range(self, sleep):
+        m = self.mission()
+        m.io.read_tof_mm = Mock(return_value=300)
+        m.look_for_target = Mock(side_effect=lambda d, seq, pitch, near=False:
+            ([('red', 'rect', 0.342, 0.05), ('red', 'rect', 0.359, 0.05)] if pitch == -20 else
+             [('red', 'square', 0.399, 0.05)] if pitch == -15 else
+             [('red', 'rect', 0.434, 0.05)] if pitch == -10 else [])
+            if d == 0 and near else [])
+        m.scan_cell()
+        plates = m.maze.plates_at((0, 0))
+        self.assertEqual(len(plates), 1)
+        self.assertEqual(plates[0]['shape'], 'rect')
+        self.assertAlmostEqual(plates[0]['near_seen'][0], 0.3505)
+
+    def test_aim_backs_up_only_with_confirmed_open_rear(self):
+        target = (1, 0)
+        m = MazeMission(SimRobot(target, 1, 4, 4), None, MazeMap(4, 4), target, 1)
+        m.grabber = Mock(seq=0)
+        m.save_map = Mock()
+        m.maze.add_target(target, 'red', 'rect', 1, (0.942, 0.0), True,
+                          near_seen=(0.342, 0.0))
+        m.confirm_target_wall = Mock(return_value=True)
+        m.move_in_cell = Mock()
+        m.io.fire = Mock()
+        m.grabber.wait_new = Mock(side_effect=Aborted())
+        self.assertEqual(m.aim_and_fire(target), 'SKIPPED')
+        m.move_in_cell.assert_not_called()
+        m.maze.set_edge(target, (0, 0), 1)
+        with self.assertRaises(Aborted):
+            m.aim_and_fire(target)
+        m.move_in_cell.assert_called_once()
+        self.assertLess(m.move_in_cell.call_args.args[0], 0)
+        self.assertLessEqual(-m.move_in_cell.call_args.args[0], 0.14)
+        self.assertTrue(m.pose_uncertain)
+        m.io.fire.assert_not_called()
+
+    def test_aim_backoff_skips_when_rear_tof_is_blocked(self):
+        target = (1, 0)
+        m = MazeMission(SimRobot(target, 1, 4, 4), None, MazeMap(4, 4), target, 1)
+        m.maze.add_target(target, 'red', 'rect', 1, (0.942, 0.0), True,
+                          near_seen=(0.342, 0.0))
+        m.maze.set_edge(target, (0, 0), 1)
+        m.confirm_target_wall = Mock(return_value=True)
+        m.io.read_tof_mm = Mock(return_value=300)
+        m.move_in_cell = Mock()
+        self.assertEqual(m.aim_and_fire(target), 'SKIPPED')
+        m.move_in_cell.assert_not_called()
+        self.assertFalse(m.pose_uncertain)
+
+    def test_explore_rescans_saved_unshot_plate(self):
+        m = self.mission()
+        m.maze.add_target((0, 0), 'red', 'square', 0, (0.956, 0), True,
+                          near_seen=(0.356, 0))
+        m.looked.add(((0, 0), 0))
+        m.pose_uncertain = False
+        was_looked = []
+        m.scan_cell = Mock(side_effect=lambda: was_looked.append(((0, 0), 0) in m.looked))
+        m.explore(fire=True, colors={'red'}, shapes={'square'})
+        self.assertEqual(was_looked, [False])
+
+    def test_round_one_dijkstra_revisits_saved_unshot_target(self):
+        maze = MazeMap(3, 1)
+        maze.visited.update({(1, 0), (2, 0)})
+        maze.set_edge((2, 0), (1, 0), 1)
+        maze.set_edge((1, 0), (0, 0), 1)
+        self.assertEqual(maze.path_to_unvisited((2, 0), 3, {(1, 0)}),
+                         [(2, 0), (1, 0)])
+
     def test_near_wall_must_still_be_confirmed_before_firing(self):
         m = self.mission()
         m.maze.add_target((0, 0), 'red', 'square', 0, (0.95, 0.0), True,
@@ -182,59 +251,90 @@ class ExploreFireTests(unittest.TestCase):
         m.confirm_target_wall.assert_called_once_with(0, near=True)
         m.io.fire.assert_not_called()
 
-    def test_too_close_for_gimbal_limit_skips_without_firing(self):
+    def test_too_close_target_skips_when_required_backoff_exceeds_limit(self):
         m = self.mission()
         m.maze.add_target((0, 0), 'red', 'square', 0, (0.87, 0.0), True,
                           near_seen=(0.27, 0.0))
         m.confirm_target_wall = Mock(return_value=True)
+        m.move_in_cell = Mock()
         m.io.fire = Mock()
         self.assertEqual(m.aim_and_fire((0, 0), 0), 'SKIPPED')
+        m.move_in_cell.assert_not_called()
         m.io.fire.assert_not_called()
+
+    def test_close_plate_is_shot_after_safe_backoff_and_returns_to_start_pose(self):
+        io = SimRobot((3, 0), 1, 4, 4)
+        io.backoff = 0.08
+        grabber = FrameGrabber(io)
+        m = MazeMission(io, grabber, MazeMap(4, 4), (3, 0), 1)
+        m.save_map = Mock()
+        m.maze.set_edge((3, 0), (2, 0), 1)
+        m.maze.add_target((3, 0), 'green', 'square', 1, (0.95, 0.0), True,
+                          near_seen=(0.35, 0.0))
+        m.armed = m.fire_ctrl.armed = True
+        grabber.start()
+        try:
+            self.assertEqual(m.aim_and_fire((3, 0), 0), 'SHOT')
+            self.assertEqual(len(io.shots), 3)
+            self.assertAlmostEqual(io.backoff, 0.08)
+            self.assertFalse(m.pose_uncertain)
+        finally:
+            grabber.stop()
+            grabber.join(timeout=2)
 
     def test_simulated_near_plate_is_hit_from_its_own_cell(self):
         io = SimRobot((3, 0), 1, 4, 4)
-        io.backoff = 0.12
+        io.backoff = 0.20
         grabber = FrameGrabber(io)
         m = MazeMission(io, grabber, MazeMap(4, 4), (3, 0), 1)
         m.save_map = Mock()
         m.maze.visited.add((3, 0))
         m.maze.add_target((3, 0), 'green', 'square', 1, (0.99, 0.0), True,
-                          near_seen=(0.39, 0.0))
+                          near_seen=(0.47, 0.0))
         m.armed = m.fire_ctrl.armed = True
         grabber.start()
         try:
             self.assertEqual(m.aim_and_fire((3, 0), 0), 'SHOT')
-            self.assertEqual([shot[0] for shot in io.shots], [(3, 0), (3, 0)])
-            self.assertEqual(m.maze.plates_at((3, 0))[0]['shots_fired'], 2)
+            self.assertEqual([shot[0] for shot in io.shots], [(3, 0)] * 3)
+            self.assertEqual(m.maze.plates_at((3, 0))[0]['shots_fired'], 3)
             self.assertEqual(io.cell, (3, 0))
-            self.assertAlmostEqual(io.backoff, 0.12)
+            self.assertAlmostEqual(io.backoff, 0.20)
         finally:
             grabber.stop()
             grabber.join(timeout=2)
 
-    def test_resuming_after_first_shot_fires_only_one_more(self):
+    def test_resuming_after_first_shot_fires_only_two_more(self):
         io = SimRobot((3, 0), 1, 4, 4)
-        io.backoff = 0.12
+        io.backoff = 0.20
         grabber = FrameGrabber(io)
         m = MazeMission(io, grabber, MazeMap(4, 4), (3, 0), 1)
         m.save_map = Mock()
         m.maze.add_target((3, 0), 'green', 'square', 1, (0.99, 0), True,
-                          near_seen=(0.39, 0), shots_fired=1)
+                          near_seen=(0.47, 0), shots_fired=1)
         m.armed = m.fire_ctrl.armed = True
         grabber.start()
         try:
             self.assertEqual(m.aim_and_fire((3, 0), 0), 'SHOT')
-            self.assertEqual(len(io.shots), 1)
-            self.assertEqual(m.maze.plates_at((3, 0))[0]['shots_fired'], 2)
-            self.assertEqual(MazeMap.from_json(m.maze.to_json()).plates_at((3, 0))[0]['shots_fired'], 2)
+            self.assertEqual(len(io.shots), 2)
+            self.assertEqual(m.maze.plates_at((3, 0))[0]['shots_fired'], 3)
+            self.assertEqual(MazeMap.from_json(m.maze.to_json()).plates_at((3, 0))[0]['shots_fired'], 3)
         finally:
             grabber.stop()
             grabber.join(timeout=2)
 
+    def test_loaded_two_shot_target_needs_one_more_shot(self):
+        m = self.mission()
+        m.maze.add_target((0, 0), 'red', 'circle', 0, (0.95, 0), True,
+                          near_seen=(0.35, 0), shot=True, shots_fired=2)
+        m.restore_state({})
+        plate = m.maze.plates_at((0, 0))[0]
+        self.assertFalse(plate['shot'])
+        self.assertEqual(plate['shots_fired'], 2)
+
     def test_measured_shot_offset_changes_the_lock_point(self):
         m = self.mission()
         m.maze.add_target((0, 0), 'red', '?', 0, (0.99, 0.0), True,
-                          near_seen=(0.39, 0.0))
+                          near_seen=(0.47, 0.0))
         m.confirm_target_wall = Mock(return_value=True)
         frame = np.zeros((540, 960, 3), dtype=np.uint8)
         candidate = gs.Target('red', 480, 270, 100, (475, 265, 10, 10))

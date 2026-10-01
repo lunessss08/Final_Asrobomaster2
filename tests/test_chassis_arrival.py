@@ -142,6 +142,81 @@ class ArrivalTests(unittest.TestCase):
                         self.assertLess(io.pos[0], 0.58)
                 io.read_tof_mm.assert_called_once()
 
+    def test_mapped_end_wall_can_confirm_near_arrival_without_driving_closer(self):
+        cases = ((False, 0.562, 213.5, 216.5, False),
+                 (True, 0.562, 213.5, 216.5, True),
+                 (True, 0.486, 226.0, 222.0, True),
+                 (True, 0.450, 213.5, 216.5, False),
+                 (True, 0.562, 170.0, 216.5, False))
+        for known_end_wall, distance, reading, wall_center, confirmed in cases:
+            with self.subTest(known_end_wall=known_end_wall, distance=distance, reading=reading):
+                io = self.robot()
+                io._stop_event = threading.Event()
+                io.tof_t, io.tof_mm, io.tof_seq = 100.0, reading, 1
+                io.wall_center_mm, io.yaw = wall_center, 0
+                io.side_speed = Mock(return_value=0)
+                io.ensure_stopped = Mock()
+                io.chassis = Mock()
+                io.read_tof_mm = Mock(return_value=reading)
+                clock = [100.0]
+                def drive_speed(**kwargs):
+                    io.pos = (distance, 0.0)
+                def sleep(seconds):
+                    clock[0] += seconds
+                    io.pos_t = io.tof_t = clock[0]
+                    io.tof_seq += 1
+                io.chassis.drive_speed.side_effect = drive_speed
+                with patch('robo_app.maze.hardware.time.monotonic', side_effect=lambda: clock[0]), \
+                        patch('robo_app.maze.hardware.time.sleep', side_effect=sleep):
+                    if confirmed:
+                        fraction = io.forward_one_cell(0, lambda: None, known_end_wall=True)
+                        self.assertAlmostEqual(fraction * CELL_M, distance)
+                        self.assertTrue(io.tof_arrival_confirmed)
+                    else:
+                        with self.assertRaisesRegex(HardwareFault, 'front ToF still blocked'):
+                            io.forward_one_cell(0, lambda: None, known_end_wall=known_end_wall)
+                        self.assertFalse(io.tof_arrival_confirmed)
+                io.read_tof_mm.assert_called_once()
+
+    def test_post_stop_tof_confirms_579_mm_arrival_only_for_mapped_wall(self):
+        for known_end_wall, reading, accepted in ((True, 228.0, True),
+                                                  (False, 228.0, False),
+                                                  (True, 270.0, False)):
+            with self.subTest(known_end_wall=known_end_wall, reading=reading):
+                io = self.robot()
+                io._stop_event = threading.Event()
+                io.tof_t, io.tof_mm, io.tof_seq = 100.0, 228.0, 1
+                io.wall_center_mm, io.yaw = 221.0, 0
+                io.side_speed = Mock(return_value=0)
+                io.ensure_stopped = Mock()
+                io.chassis = Mock()
+                io.read_tof_mm = Mock(return_value=reading)
+                clock = [100.0]
+
+                def drive_speed(**kwargs):
+                    io.pos = (0.581, 0.0)
+
+                def stop():
+                    io.pos = (0.579, 0.0)
+
+                def sleep(seconds):
+                    clock[0] += seconds
+                    io.pos_t = io.tof_t = clock[0]
+                    io.tof_seq += 1
+
+                io.chassis.drive_speed.side_effect = drive_speed
+                io.stop_wheels.side_effect = stop
+                with patch('robo_app.maze.hardware.time.monotonic', side_effect=lambda: clock[0]), \
+                        patch('robo_app.maze.hardware.time.sleep', side_effect=sleep):
+                    if accepted:
+                        fraction = io.forward_one_cell(0, lambda: None, known_end_wall=known_end_wall)
+                        self.assertAlmostEqual(fraction * CELL_M, 0.579)
+                        self.assertTrue(io.tof_arrival_confirmed)
+                    else:
+                        with self.assertRaisesRegex(HardwareFault, 'not at cell centre'):
+                            io.forward_one_cell(0, lambda: None, known_end_wall=known_end_wall)
+                        self.assertFalse(io.tof_arrival_confirmed)
+
 
 if __name__ == '__main__':
     unittest.main()

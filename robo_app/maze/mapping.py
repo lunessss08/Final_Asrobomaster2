@@ -182,37 +182,56 @@ class MazeMap:
 
     def path_to_unvisited(self, start: Cell, heading: int,
                           preferred_targets: Optional[Set[Cell]] = None) -> Optional[List[Cell]]:
-        """Round 1 BFS: visit matching targets first, then other reachable cells.
+        """Round 1 Dijkstra over (cell, heading), including the cost of turns.
 
-        All routes minimize cell transitions; direction only breaks equal-length
-        ties. Keep A* in path_to() for explicit destinations in round 2.
+        Prefer nearby unfinished targets without taking a long detour. Only
+        traverse confirmed open edges; a new scan replans from the next cell.
+        Round 2 continues to use A* in path_to().
         """
-        parents = {start: None}
-        queue = deque([start])
-        preferred = empty = any_unvisited = None
-        directions = (heading, (heading + 1) % 4, (heading + 3) % 4, (heading + 2) % 4)
+        origin = (start, heading)
+        distances = {origin: 0.0}
+        parents = {origin: None}
+        queue = [(0.0, 0, origin)]
+        sequence = 0
+        choice = None
         while queue:
-            cell = queue.popleft()
-            if cell != start and cell not in self.visited:
-                if any_unvisited is None:
-                    any_unvisited = cell
-                if cell not in self.targets and empty is None:
-                    empty = cell
-                if preferred_targets and cell in preferred_targets and preferred is None:
-                    preferred = cell
-            for d in directions:
+            cost, _, state = heapq.heappop(queue)
+            if cost > distances[state]:
+                continue
+            cell, head = state
+            preferred = bool(preferred_targets and cell in preferred_targets)
+            if cell != start and (preferred or cell not in self.visited):
+                # A one-cell bonus makes a matching target attractive when it
+                # is nearby, while the travel cost still controls long trips.
+                score = cost - (1.0 if preferred else 0.0)
+                # In map-only mode, inspect an empty cell first on near ties.
+                is_other_target = cell in self.targets and not preferred
+                if is_other_target:
+                    score += 0.8
+                candidate = (score, 0 if preferred else 2 if is_other_target else 1,
+                             cost, cell, head)
+                if choice is None or candidate < choice:
+                    choice = candidate
+            for d in (head, (head + 1) % 4, (head + 3) % 4, (head + 2) % 4):
                 nxt = self.step(cell, d)
-                if nxt not in parents and self.can_drive(cell, nxt):
-                    parents[nxt] = cell
-                    queue.append(nxt)
+                if not self.can_drive(cell, nxt):
+                    continue
+                turn = (d - head) % 4
+                new_cost = cost + 1.0 + (0.0 if turn == 0 else 1.5 if turn == 2 else 0.8)
+                next_state = (nxt, d)
+                if new_cost < distances.get(next_state, float('inf')):
+                    distances[next_state] = new_cost
+                    parents[next_state] = state
+                    sequence += 1
+                    heapq.heappush(queue, (new_cost, sequence, next_state))
 
-        goal = preferred or empty or any_unvisited
-        if goal is None:
+        if choice is None:
             return None
         path = []
-        while goal is not None:
-            path.append(goal)
-            goal = parents[goal]
+        state = (choice[3], choice[4])
+        while state is not None:
+            path.append(state[0])
+            state = parents[state]
         return path[::-1]
 
     def distances_from(self, start: Cell) -> Dict[Cell, int]:

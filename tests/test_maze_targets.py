@@ -132,7 +132,7 @@ class MazeTargetTests(unittest.TestCase):
         maze.visited.add(target)
         self.assertIsNone(maze.path_to_unvisited(target, 1))
 
-    def test_round_one_bfs_uses_fewest_cells_while_round_two_keeps_astar(self):
+    def test_round_one_dijkstra_and_round_two_keeps_astar(self):
         maze = MazeMap(3, 2)
         for y in range(2):
             for x in range(2):
@@ -146,6 +146,25 @@ class MazeTargetTests(unittest.TestCase):
         self.assertEqual(maze.path_to_unvisited(start, 0), [start, target, goal])
         self.assertEqual(maze.path_to(start, 0, goal),
                          [start, (0, 1), (1, 1), (2, 1), goal])
+
+    def test_round_one_dijkstra_can_choose_two_straight_cells_over_a_uturn(self):
+        maze = MazeMap(4, 1)
+        start = (1, 0)
+        maze.visited.update({start, (2, 0)})
+        for a, b in (((0, 0), start), (start, (2, 0)), ((2, 0), (3, 0))):
+            maze.set_edge(a, b, 1)
+        self.assertEqual(maze.path_to_unvisited(start, 1),
+                         [start, (2, 0), (3, 0)])
+
+    def test_round_one_dijkstra_does_not_detour_to_a_far_target(self):
+        maze = MazeMap(4, 1)
+        start = (0, 0)
+        maze.visited.add(start)
+        for x in range(3):
+            maze.set_edge((x, 0), (x + 1, 0), 1)
+        maze.add_target((3, 0), 'red', 'square', 1, (0.95, 0), True)
+        self.assertEqual(maze.path_to_unvisited(start, 1, {(3, 0)}),
+                         [start, (1, 0)])
 
     def test_multiple_wall_directions_keep_separate_shooting_spots(self):
         m = MazeMap(3, 3)
@@ -206,7 +225,7 @@ class MazeTargetTests(unittest.TestCase):
         import tempfile
         from pathlib import Path
         io = SimRobot((2, 0), 1, 4, 4)
-        io.backoff = 0.12
+        io.backoff = 0.20
         io.EXTRA_TARGETS = [((3, 0), 'green', 'square', 1, 0.14)]
         grabber = FrameGrabber(io)
         m = MazeMission(io, grabber, MazeMap(4, 4), (2, 0), 1)
@@ -225,7 +244,7 @@ class MazeTargetTests(unittest.TestCase):
             self.assertEqual(len(m.plate_results), 2)
             self.assertEqual(set(m.plate_results.values()), {'SHOT'})
             self.assertEqual(set(io.shot_plates), {((3, 0), 0.0), ((3, 0), 0.14)})
-            self.assertEqual(len(io.shot_plates), 4)
+            self.assertEqual(len(io.shot_plates), 6)
         finally:
             m.stop()
             grabber.stop()

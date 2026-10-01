@@ -60,9 +60,9 @@ def main():
         print(f" โหลด {MAP_FILE.name}: สนาม {width}x{height} เริ่มที่ {start} ทิศ {DIR_NAMES[heading]}")
         print(f" เป้าที่รอบ 1 เจอ: {found}")
         if maze.explored:
-            print(" วางหุ่นที่จุดเริ่ม หันทิศเดิม แล้วกด ENTER ในหน้าต่างโปรแกรมเพื่อยิง")
+            print(" วางหุ่นที่จุดเริ่ม หันทิศเดิม กด h ยืนยัน แล้วกด ENTER ในหน้าต่างโปรแกรมเพื่อยิง")
         else:
-            print(f" รอบ 1 ยังไม่จบ (สำรวจแล้ว {len(maze.visited)} ช่อง): วางหุ่นที่จุดเริ่ม หันทิศเดิม แล้วกด e สำรวจต่อ")
+            print(f" รอบ 1 ยังไม่จบ (สำรวจแล้ว {len(maze.visited)} ช่อง): วางหุ่นที่จุดเริ่ม หันทิศเดิม กด h ยืนยัน แล้วกด e สำรวจต่อ")
     elif args.sim:
         print(" [SIM] ใช้สนามตัวอย่าง 4x4")
         width = height = 4
@@ -100,6 +100,11 @@ def main():
     mission = MazeMission(io, grabber, maze, start, heading, use_slam=not args.no_slam)
     if saved is not None:
         mission.restore_state(saved)
+        # The saved pose can predate a fault or the robot being picked up. A
+        # loaded map is only safe to use after the physical START is verified.
+        mission.pose_uncertain = True
+        mission.status = "Position unconfirmed"
+        mission.log("Place robot at START, then CONFIRM START (h) before running")
     try:
         App(mission, grabber).run()
     except KeyboardInterrupt:

@@ -189,7 +189,7 @@ class SimRobot:
         self._check_stop()
         self.yaw = normalize_angle(self.yaw + deg)
 
-    def forward_one_cell(self, target_yaw: float, check) -> float:
+    def forward_one_cell(self, target_yaw: float, check, known_end_wall: bool = False) -> float:
         check()
         nxt = MazeMap.step(self.cell, self.heading)
         if self._blocked(self.cell, nxt):
@@ -209,7 +209,7 @@ class SimRobot:
         self._check_stop()
         self.last_lateral_move = left_m
 
-    def fire(self) -> bool:
+    def fire(self, times: int = 1) -> bool:
         """ บันทึกว่ากระสุนไปโดนเป้าไหน (ใกล้แนวเล็งไม่เกิน 3°) """
         self._integrate()
         self._check_stop()
@@ -222,8 +222,9 @@ class SimRobot:
             if err < best_err:
                 best, best_err = cell, err
                 best_plate = (cell, offset)
-        self.shots.append((best, round(best_err, 2)))
-        self.shot_plates.append(best_plate)
+        for _ in range(times):
+            self.shots.append((best, round(best_err, 2)))
+            self.shot_plates.append(best_plate)
         return True
 
     def set_status_led(self, armed: bool, busy: bool):

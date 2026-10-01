@@ -73,6 +73,7 @@ class CenteringTests(unittest.TestCase):
         io.ensure_stopped = Mock()
         io.move_sideways(0.04)
         io.chassis.move.assert_called_once_with(x=0, y=-0.04, z=0, xy_speed=0.15)
+        self.assertEqual(io._wait_action.call_args.args[2], 5)
         io.ensure_stopped.assert_called_once()
         with self.assertRaises(HardwareFault):
             io.move_sideways(0.07)

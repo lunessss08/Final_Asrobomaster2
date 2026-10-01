@@ -77,12 +77,15 @@ class ReliabilityTests(unittest.TestCase):
             io.stop_all.assert_called_once()
 
     def test_sdk_action_timeout_stops_motion(self):
-        io = self.hardware()
-        action = SimpleNamespace(is_completed=False)
-        with patch('robo_app.maze.hardware.time.monotonic', side_effect=[0, 5]):
-            with self.assertRaises(HardwareFault):
-                io._wait_action('move', action, 4)
-        io.stop_all.assert_called_once()
+        for action in (SimpleNamespace(is_completed=False),
+                       SimpleNamespace(is_completed=True, has_succeeded=False,
+                                       state='action_running')):
+            io = self.hardware()
+            with self.subTest(action=action), \
+                    patch('robo_app.maze.hardware.time.monotonic', side_effect=[0, 5]):
+                with self.assertRaises(HardwareFault):
+                    io._wait_action('move', action, 4)
+            io.stop_all.assert_called_once()
 
     def test_successful_action_uses_status_without_sdk_blocking_wait(self):
         io = self.hardware()
@@ -91,19 +94,39 @@ class ReliabilityTests(unittest.TestCase):
         action.wait_for_completed.assert_not_called()
         io.stop_all.assert_not_called()
 
+    def test_sdk_100_percent_running_waits_for_final_success_state(self):
+        io = self.hardware()
+        action = SimpleNamespace(is_completed=True, has_succeeded=False, state='action_running')
+        def finish(_seconds):
+            action.state = 'action_succeeded'
+            action.has_succeeded = True
+        io._pause = Mock(side_effect=finish)
+        io._wait_action('lateral correction', action, 5)
+        io._pause.assert_called_once()
+        io.stop_all.assert_not_called()
+
     def test_gimbal_timeout_scales_with_travel_and_reports_command(self):
         io = self.hardware()
         io.gimbal = Mock()
         io._wait_action = Mock()
         io._gimbal_pose = (0, -90)
-        io.gimbal_to(-20, 180, speed=60)
-        self.assertAlmostEqual(io._wait_action.call_args.args[2], 7.5)
+        io.gimbal_to(-20, 180, speed=30)
+        self.assertAlmostEqual(io._wait_action.call_args.args[2], 12.0)
         self.assertEqual(io._gimbal_pose, (-20, 180))
 
         io._wait_action.side_effect = HardwareFault('gimbal move: timed out')
-        with self.assertRaisesRegex(HardwareFault, r'pitch -15°.*yaw \+180°.*limit 6\.0s'):
+        with self.assertRaisesRegex(HardwareFault, r'pitch -15°.*yaw \+180°.*limit 10\.0s'):
             io.gimbal_to(-15, 180, speed=60)
         self.assertEqual(io._gimbal_pose, (-20, 180))
+
+    def test_water_burst_uses_one_sdk_command_for_three_shots(self):
+        io = self.hardware()
+        io.blaster = Mock()
+        io.blaster.fire.return_value = True
+        io.leds = Mock()
+        self.assertTrue(io.fire(times=3))
+        self.assertEqual(io.blaster.fire.call_count, 1)
+        self.assertEqual(io.blaster.fire.call_args.kwargs['times'], 3)
 
     def test_chassis_led_is_red_during_motion_and_white_for_gimbal(self):
         io = self.hardware()
@@ -263,7 +286,7 @@ class ReliabilityTests(unittest.TestCase):
     def test_size_change_restarts_lock_before_evaluation(self):
         m = self.mission()
         target = m.cell
-        m.maze.add_target(target, 'red', '?', 1, (0.95, 0), near_seen=(0.35, 0))
+        m.maze.add_target(target, 'red', '?', 1, (0.95, 0), near_seen=(0.47, 0))
         m.confirm_target_wall = Mock(return_value=True)
         frame = np.zeros((540, 960, 3), dtype=np.uint8)
         fd = gs.prepare_frame(frame)

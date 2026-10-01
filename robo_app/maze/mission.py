@@ -8,6 +8,7 @@ from .shot_calibration import load_shot_calibration, shot_offset
 from .grid_slam import GridSLAM
 from .settings import (
     AIM_ACQUIRE_DEG,
+    AIM_PITCH_MARGIN_DEG,
     AIM_TIMEOUT_S,
     AIM_TRACK_JUMP_DEG,
     AIM_TRACK_AREA_RATIO,
@@ -22,13 +23,13 @@ from .settings import (
     GIMBAL_SCAN_SPEED,
     LOOK_LOG_ROOT,
     MAP_FILE,
-    MAX_BACKOFF_M,
+    MAX_AIM_BACKOFF_M,
     MIN_TRAVEL_FRACTION,
-    PITCH_MARGIN_DEG,
     PITCH_MIN_DEG,
     ROUND1_BUDGET_S,
     SHOTS_PER_TARGET,
     TARGET_CELL_RANGE,
+    TARGET_DEPTH_DRIFT_M,
     TARGET_HEIGHT_M,
     TARGET_MAX_LATERAL_M,
     TARGET_MIN_HITS,
@@ -286,14 +287,20 @@ class MazeMission:
                 raise
             self.status = f"Drive {self.cell} -> {nxt}  {getattr(self.io, 'side_status', '')}"
             try:
-                fraction = self.io.forward_one_cell(self.yaw_offset + YAW_TARGETS[d], self.check)
+                end_wall = (self.slam is not None
+                            and self.maze.edge(nxt, MazeMap.step(nxt, d)) == -1)
+                fraction = self.io.forward_one_cell(self.yaw_offset + YAW_TARGETS[d], self.check,
+                                                    known_end_wall=end_wall)
             except (Aborted, HardwareFault):
                 self.pose_uncertain = True  # หยุดกลางทาง: รถไม่อยู่กลางช่องไหนแล้ว
                 raise
             if fraction > 1 + CELL_ARRIVAL_TOL_M / CELL_M:
                 self.pose_uncertain = True
                 raise HardwareFault("drive overshot the next cell centre")
-            if fraction < MIN_TRAVEL_FRACTION:
+            if getattr(self.io, 'tof_arrival_confirmed', False):
+                self.log(f"ToF confirms {self.cell}->{nxt} centre despite odometry "
+                         f"{fraction * CELL_M:.3f} m; checking with SLAM")
+            if fraction < MIN_TRAVEL_FRACTION and not getattr(self.io, 'tof_arrival_confirmed', False):
                 if self.slam is not None:
                     self.pose_uncertain = True
                     self.io.stop_all()
@@ -352,6 +359,14 @@ class MazeMission:
         self._explore_colors = frozenset(colors or ())
         self._explore_shapes = frozenset(shapes or ())
         self._explore_attempted = set()
+        if fire:
+            # A saved SKIPPED plate needs a fresh range estimate on resume.
+            for cell, plates in self.maze.target_plates.items():
+                for plate in plates:
+                    if (not plate.get('shot', False) and plate['wall'] is not None
+                            and plate.get('near_seen') is not None
+                            and self.matches_explore_filter(plate)):
+                        self.looked.discard((cell, plate['wall']))
         self.armed = self.fire_ctrl.armed = False
         self.log("ROUND 1: " + ("EXPLORE + FIRE" if fire else "MAP ONLY"))
         if fire:
@@ -380,7 +395,9 @@ class MazeMission:
                 path = self.maze.path_to_unvisited(self.cell, self.heading, preferred)
                 if path is None:
                     break
-                self.drive_path(path, on_arrive=self.scan_cell)
+                # Scan and replan after each cell so newly discovered walls,
+                # targets, and SLAM corrections affect the next decision.
+                self.drive_path(path[:2], on_arrive=self.scan_cell)
             self.finish_requested = False
             self.maze.explored = True
             self.save_map()
@@ -603,25 +620,30 @@ class MazeMission:
                     self.pose_uncertain = True
                     raise HardwareFault("body moved during gimbal target sweep")
                 seq = self.grabber.seq
-                near_hits.extend(self.look_for_target(d, seq, pitch, near=True))
+                near_hits.extend((pitch, color, shape, dist, lateral)
+                                 for color, shape, dist, lateral
+                                 in self.look_for_target(d, seq, pitch, near=True))
             if near_hits:
                 # A nearby plate may be cropped at one pitch. Merge sightings
                 # across the sweep and choose the most common shape before
                 # storing it; do not let a late partial view overwrite it.
                 tracks = []
-                for color, shape, dist, lateral in near_hits:
+                for pitch, color, shape, dist, lateral in near_hits:
                     shooting_geo = (dist + CELL_M, lateral)
                     track = next((t for t in tracks if t['color'] == color and
-                                  math.hypot(shooting_geo[0] - np.median(t['geos'], axis=0)[0],
-                                             shooting_geo[1] - np.median(t['geos'], axis=0)[1]) < TARGET_TRACK_M), None)
+                                  abs(shooting_geo[0] - np.median(t['geos'], axis=0)[0]) < TARGET_DEPTH_DRIFT_M and
+                                  abs(lateral - np.median(t['geos'], axis=0)[1]) < TARGET_TRACK_M), None)
                     if track is None:
-                        track = {'color': color, 'geos': [], 'shapes': Counter()}
+                        track = {'color': color, 'geos': [], 'by_pitch': {}, 'shapes': Counter()}
                         tracks.append(track)
                     track['geos'].append(shooting_geo)
+                    track['by_pitch'].setdefault(pitch, []).append(shooting_geo)
                     track['shapes'][shape] += 1
                 for track in tracks:
                     shape = track['shapes'].most_common(1)[0][0]
-                    distance, lateral = np.median(track['geos'], axis=0)
+                    # A shallow view can crop the plate and bias its range high.
+                    # Use the deepest pitch that actually saw this plate.
+                    distance, lateral = np.median(track['by_pitch'][min(track['by_pitch'])], axis=0)
                     if self.maze.add_target(c, track['color'], shape, d,
                                             (float(distance), float(lateral)), wall_verified=True,
                                             near_seen=(float(distance - CELL_M), float(lateral))):
@@ -992,18 +1014,41 @@ class MazeMission:
         far = seen[0]
         ground = max(0.05, far - CAMERA_FORWARD_M)
         yaw0 = math.degrees(math.atan2(seen[1], ground))
-        # เป้าเตี้ยและใกล้: ถ้าต้องก้มเกินที่หัวทำได้ ถอยรถในช่องเล็กน้อยให้มุมก้มพอดี
-        max_depression = math.radians(-PITCH_MIN_DEG - PITCH_MARGIN_DEG)
-        required_ground = drop / math.tan(max_depression)
-        if ground + MAX_BACKOFF_M < required_ground:
-            self.log(f"Skip near target {target}: too close to center with safe backoff")
-            return "SKIPPED"
-        backoff = min(MAX_BACKOFF_M, max(0.0, required_ground - ground))
-        if backoff > 0.01:
+        backoff = 0.0
+        pose_before_backoff = self.pose_uncertain
+        pitch_limit_ground = drop / math.tan(math.radians(-PITCH_MIN_DEG))
+        if ground < pitch_limit_ground:
+            # Only a plate below the gimbal's physical pitch range needs a
+            # short retreat. Keep the robot centre in this cell and require a
+            # mapped opening plus a fresh, clear rear ToF reading first.
+            desired_ground = drop / math.tan(math.radians(-PITCH_MIN_DEG - AIM_PITCH_MARGIN_DEG))
+            backoff = desired_ground - ground
+            if backoff > MAX_AIM_BACKOFF_M:
+                self.log(f"Skip near target {target}: needs {backoff:.3f} m aim backoff "
+                         f"(limit {MAX_AIM_BACKOFF_M:.3f} m)")
+                return "SKIPPED"
+            rear_dir = (wall + 2) % 4
+            rear = MazeMap.step(target, rear_dir)
+            if not self.maze.can_drive(target, rear):
+                self.log(f"Skip near target {target}: no confirmed open rear for aim backoff")
+                return "SKIPPED"
+            rear_rel = {0: 0, 1: 90, 2: 180, 3: -90}[(rear_dir - self.heading) % 4]
+            self.io.gimbal_to(0, rear_rel)
+            try:
+                rear_tof = self.io.read_tof_mm()
+            finally:
+                self.io.gimbal_to(0, 0)
+            if rear_tof is None or rear_tof < WALL_TOF_MM:
+                self.log(f"Skip near target {target}: rear ToF not clear for "
+                         f"{backoff:.3f} m aim backoff ({rear_tof} mm)")
+                return "SKIPPED"
             self.move_in_cell(-backoff)
-            self.pose_uncertain = True  # ยังถอยเล็งอยู่จนกว่าจะกลับกลางช่องสำเร็จ
-        yaw0 = math.degrees(math.atan2(seen[1], ground + backoff))
-        correction_x, correction_y = shot_offset(self.shot_calibration, far + backoff)
+            self.pose_uncertain = True  # Remain uncertain until the return move succeeds.
+            self.log(f"Aim backoff {backoff:.3f} m within cell {target}")
+        aim_range = far + backoff
+        aim_ground = ground + backoff
+        yaw0 = math.degrees(math.atan2(seen[1], aim_ground))
+        correction_x, correction_y = shot_offset(self.shot_calibration, aim_range)
         aim_x = gs.AIM_OFFSET_X_DEG + correction_x
         aim_y = gs.AIM_OFFSET_Y_DEG + correction_y
         acquire_radius = AIM_ACQUIRE_DEG
@@ -1014,7 +1059,7 @@ class MazeMission:
                          (max(TARGET_NEAR_RANGE[0], peer['seen'][0] - CELL_M), peer['seen'][1]))
             angle = math.degrees(math.atan2(peer_seen[1], max(0.05, peer_seen[0] - CAMERA_FORWARD_M) + backoff))
             acquire_radius = min(acquire_radius, max(0.5, abs(angle - yaw0) / 2))
-        self.io.gimbal_to(max(PITCH_MIN_DEG, -math.degrees(math.atan2(drop, ground + backoff))), yaw0)
+        self.io.gimbal_to(max(PITCH_MIN_DEG, -math.degrees(math.atan2(drop, aim_ground))), yaw0)
         self.pid_yaw.reset()
         self.pid_pitch.reset()
         self.fire_ctrl.reset_lock()
@@ -1075,11 +1120,12 @@ class MazeMission:
                     if finish_on_request and self.finish_requested:
                         break
                     self.io.gimbal_speed(0, 0)
-                    if self.io.fire():
-                        shots += 1
+                    remaining = SHOTS_PER_TARGET - shots
+                    if self.io.fire(times=remaining):
+                        shots += remaining
                         plate['shots_fired'] = shots
                         self.save_map(quiet=True)
-                        self.log(f"FIRE at {color.upper()} {target} ({shots}/{SHOTS_PER_TARGET})")
+                        self.log(f"FIRE {remaining} at {color.upper()} {target} ({shots}/{SHOTS_PER_TARGET})")
                     self.fire_ctrl.mark_fired()
                     if shots >= SHOTS_PER_TARGET:
                         result = "SHOT"
@@ -1091,17 +1137,16 @@ class MazeMission:
                         break
                 else:
                     hold_since = None
-        except (Aborted, HardwareFault):
-            if backoff > 0.01:
-                self.pose_uncertain = True  # หยุดตอนถอยรถเล็งอยู่: รถไม่อยู่กลางช่องแล้ว
-            raise
         finally:
             self.io.gimbal_speed(0, 0)
             self.overlay = []
-        if backoff > 0.01:
-            self.move_in_cell(backoff)  # กลับกลางช่อง
-            self.pose_uncertain = False
+        if backoff:
+            self.move_in_cell(backoff)
+            self.pose_uncertain = pose_before_backoff
         self.io.gimbal_to(0, 0)
+        if result == "SKIPPED" and not (finish_on_request and self.finish_requested):
+            self.log(f"Skip near target {target}: aim timed out after {AIM_TIMEOUT_S:.0f} s "
+                     f"({self.status}; range {aim_range:.3f} m, backoff {backoff:.3f} m)")
         return result
 
     def recenter(self):
@@ -1110,6 +1155,12 @@ class MazeMission:
     def restore_state(self, saved: dict):
         """ --load: ของที่รอบก่อนรู้แล้วแต่ไม่ได้อยู่ในแผนที่ (ทิศที่มองแล้ว, ระยะกลางช่องที่เรียนได้) """
         self.looked = {((x, y), d) for x, y, d in saved.get("looked", [])}
+        # A target marked complete under the previous two-shot rule still
+        # needs its final shot under the current three-shot rule.
+        for plates in self.maze.target_plates.values():
+            for plate in plates:
+                if 0 < plate.get('shots_fired', 0) < SHOTS_PER_TARGET:
+                    plate['shot'] = False
         for row in saved.get("plate_results", []):
             cell = tuple(row['cell'])
             index = row['plate_index']

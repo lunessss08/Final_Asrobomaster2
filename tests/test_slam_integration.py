@@ -97,6 +97,22 @@ class SlamIntegrationTests(unittest.TestCase):
         self.assertEqual(m.maze.edge((0, 0), (1, 0)), 1)
         m.io.move_straight.assert_not_called()
 
+    def test_slam_accepts_tof_confirmed_arrival_at_mapped_end_wall(self):
+        m = self.mission()
+        start, target, beyond = (0, 0), (1, 0), (2, 0)
+        m.maze.set_edge(start, target, 1)
+        m.maze.set_edge(target, beyond, -1)
+        m.face = Mock()
+        m.center_before_move = Mock()
+        m.io.forward_one_cell = Mock(return_value=0.562 / 0.6)
+        m.io.tof_arrival_confirmed = True
+        m.slam.predict_move = Mock()
+        m.localize_slam = Mock()
+        self.assertTrue(m.drive_path([start, target], on_arrive=m.localize_slam))
+        self.assertEqual(m.cell, target)
+        self.assertTrue(m.io.forward_one_cell.call_args.kwargs['known_end_wall'])
+        m.localize_slam.assert_called_once()
+
     def test_corrected_pose_discards_old_route(self):
         m = self.mission()
         m.face = Mock()
